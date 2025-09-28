@@ -2,7 +2,7 @@
 
 https://tryhackme.com/room/archangel
 
-## Reconnaissance
+## Enumeration
 
 The first step is to perform basic enumeration using Nmap. 
 ```
@@ -15,7 +15,6 @@ PORT   STATE SERVICE
 22/tcp open  ssh
 80/tcp open  http
 ```
-
 Add the target ip address to `/etc/hosts` to map it to `mafialive.thm` for local access.
 
 After visiting mafialive.thm, found first flag.
@@ -23,12 +22,10 @@ After visiting mafialive.thm, found first flag.
 UNDER DEVELOPMENT
 thm{[REDACTED]} 
 ```
-
 Found test.php while looking at robots.txt.
 ```
 http://mafialive.thm/test.php?view=/var/www/html/development_testing/mrrobot.php
 ```
-## Enumeration
 
 ### Local File Inclusion
 

